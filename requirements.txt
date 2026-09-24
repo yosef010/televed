@@ -1,2 +1,4 @@
-telethon
+telethon==1.45.0
+fastapi
+uvicorn[standard]
 httpx
