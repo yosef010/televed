@@ -4,7 +4,6 @@ import logging
 import mimetypes
 import shutil
 from pathlib import Path
-from datetime import datetime, timezone
 
 import httpx
 import uvicorn
@@ -15,7 +14,7 @@ from telethon.sessions import StringSession
 
 
 # =========================================================
-# CONFIG
+# Environment Variables
 # =========================================================
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
@@ -29,14 +28,9 @@ WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 PORT = int(os.environ.get("PORT", "8080"))
 
 TEMP_DIR = Path(
-    os.environ.get(
-        "TEMP_DIR",
-        "/tmp/telegram_videos"
-    )
+    os.environ.get("TEMP_DIR", "/tmp/telegram_videos")
 )
 
-# Maximum allowed video size.
-# Default: 200 MB
 MAX_VIDEO_MB = int(
     os.environ.get("MAX_VIDEO_MB", "200")
 )
@@ -45,7 +39,7 @@ MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024
 
 
 # =========================================================
-# LOGGING
+# Logging
 # =========================================================
 
 logging.basicConfig(
@@ -57,7 +51,7 @@ logger = logging.getLogger("telegram-monitor")
 
 
 # =========================================================
-# APP
+# FastAPI
 # =========================================================
 
 app = FastAPI(
@@ -66,7 +60,7 @@ app = FastAPI(
 
 
 # =========================================================
-# TELEGRAM CLIENT
+# Telegram Client
 # =========================================================
 
 client = TelegramClient(
@@ -77,27 +71,21 @@ client = TelegramClient(
 
 
 # =========================================================
-# PROCESS CONTROL
+# Processing State
 # =========================================================
 
-# IMPORTANT:
-# Only ONE video is processed at a time.
-#
-# This protects the Railway service from multiple
-# simultaneous large downloads/uploads.
 process_lock = asyncio.Lock()
 
-# Prevent duplicate processing while the service is alive.
 processing_messages = set()
 
 
 # =========================================================
-# FILE HELPERS
+# Filename Helpers
 # =========================================================
 
 def safe_filename(filename: str) -> str:
     """
-    Make Telegram filename safe for Linux filesystem.
+    Make sure the filename is safe to use on the filesystem.
     """
 
     filename = os.path.basename(filename)
@@ -105,8 +93,7 @@ def safe_filename(filename: str) -> str:
     allowed = (
         "abcdefghijklmnopqrstuvwxyz"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "0123456789"
-        "._- "
+        "0123456789._- "
     )
 
     filename = "".join(
@@ -119,25 +106,29 @@ def safe_filename(filename: str) -> str:
 
 def get_filename(message, message_id: int) -> str:
     """
-    Get original filename if Telegram provides one.
+    Try to get the original Telegram filename.
     """
 
     if message.document:
 
         for attribute in message.document.attributes:
 
-            if hasattr(attribute, "file_name"):
-
-                if attribute.file_name:
-
-                    return attribute.file_name
+            if (
+                hasattr(attribute, "file_name")
+                and attribute.file_name
+            ):
+                return attribute.file_name
 
     return f"telegram_video_{message_id}.mp4"
 
 
+# =========================================================
+# Video Detection
+# =========================================================
+
 def is_video(message) -> bool:
     """
-    Detect Telegram videos.
+    Detect whether a Telegram message contains a video.
     """
 
     if message.video:
@@ -145,7 +136,9 @@ def is_video(message) -> bool:
 
     if message.document:
 
-        mime_type = message.document.mime_type or ""
+        mime_type = (
+            message.document.mime_type or ""
+        )
 
         if mime_type.startswith("video/"):
             return True
@@ -153,9 +146,13 @@ def is_video(message) -> bool:
     return False
 
 
+# =========================================================
+# Temporary Directory Cleanup
+# =========================================================
+
 def cleanup_temp_directory():
     """
-    Delete ALL old temporary files when the service starts.
+    Delete everything left inside TEMP_DIR when the service starts.
     """
 
     TEMP_DIR.mkdir(
@@ -172,11 +169,13 @@ def cleanup_temp_directory():
             if item.is_file() or item.is_symlink():
 
                 item.unlink()
+
                 deleted += 1
 
             elif item.is_dir():
 
                 shutil.rmtree(item)
+
                 deleted += 1
 
         except Exception as e:
@@ -191,7 +190,7 @@ def cleanup_temp_directory():
 
 
 # =========================================================
-# HEALTH ENDPOINTS
+# API Routes
 # =========================================================
 
 @app.get("/")
@@ -214,7 +213,7 @@ async def health():
 
 
 # =========================================================
-# OPTIONAL MANUAL DELETE ENDPOINT
+# Delete File API
 # =========================================================
 
 @app.post("/complete/{filename}")
@@ -266,7 +265,7 @@ async def complete_video(
 
 
 # =========================================================
-# SEND VIDEO TO N8N
+# Send Video To n8n
 # =========================================================
 
 async def send_to_n8n(
@@ -279,10 +278,17 @@ async def send_to_n8n(
     filename = file_path.name
 
     mime_type = (
-        mimetypes.guess_type(str(file_path))[0]
+        mimetypes.guess_type(
+            str(file_path)
+        )[0]
         or "video/mp4"
     )
 
+    # IMPORTANT:
+    # Get the file size directly from the filesystem.
+    #
+    # This does NOT load the video into RAM.
+    #
     file_size = file_path.stat().st_size
 
     logger.info(
@@ -292,24 +298,54 @@ async def send_to_n8n(
         f"size={file_size / 1024 / 1024:.2f} MB"
     )
 
+    # =====================================================
+    # Metadata sent to n8n
+    # =====================================================
+
     data = {
 
-        "message_id": str(message.id),
+        "message_id": str(
+            message.id
+        ),
 
         "filename": filename,
 
-        "caption": message.message or "",
+        "caption": (
+            message.message or ""
+        ),
 
-        "channel_username":
-            channel_username or "",
+        "channel_username": (
+            channel_username or ""
+        ),
 
-        "channel_title":
+        "channel_title": (
             channel_title or ""
+        ),
+
+        # IMPORTANT:
+        # Raw size in BYTES.
+        #
+        # Example:
+        # 156 KB -> 159744
+        #
+        "file_size_bytes": str(
+            file_size
+        ),
     }
+
+    # =====================================================
+    # Webhook Authentication
+    # =====================================================
 
     headers = {
-        "X-Webhook-Secret": WEBHOOK_SECRET
+
+        "X-Webhook-Secret":
+            WEBHOOK_SECRET
     }
+
+    # =====================================================
+    # HTTP Timeout
+    # =====================================================
 
     timeout = httpx.Timeout(
 
@@ -321,6 +357,10 @@ async def send_to_n8n(
 
         pool=30
     )
+
+    # =====================================================
+    # Upload To n8n
+    # =====================================================
 
     async with httpx.AsyncClient(
         timeout=timeout
@@ -366,7 +406,7 @@ async def send_to_n8n(
 
 
 # =========================================================
-# TELEGRAM EVENT
+# Telegram New Message Handler
 # =========================================================
 
 @client.on(
@@ -386,38 +426,43 @@ async def new_message_handler(event):
         f"id={message_id}"
     )
 
-    # -----------------------------------------------------
-    # Check video
-    # -----------------------------------------------------
+    # =====================================================
+    # Ignore Non-Videos
+    # =====================================================
 
     if not is_video(message):
 
         logger.info(
-            f"Message {message_id} ignored: not a video."
+            f"Message {message_id} ignored: "
+            f"not a video."
         )
 
         return
 
-    # -----------------------------------------------------
-    # Prevent duplicate processing
-    # -----------------------------------------------------
+    # =====================================================
+    # Prevent Duplicate Processing
+    # =====================================================
 
     if message_id in processing_messages:
 
         logger.warning(
-            f"Message {message_id} already processing. "
-            f"Ignoring duplicate event."
+            f"Message {message_id} already "
+            f"processing. Ignoring duplicate event."
         )
 
         return
 
-    processing_messages.add(message_id)
+    processing_messages.add(
+        message_id
+    )
+
+    file_path = None
 
     try:
 
-        # -------------------------------------------------
-        # ONLY ONE VIDEO AT A TIME
-        # -------------------------------------------------
+        # =================================================
+        # Process Only One Video At A Time
+        # =================================================
 
         async with process_lock:
 
@@ -426,9 +471,9 @@ async def new_message_handler(event):
                 f"message={message_id}"
             )
 
-            # ---------------------------------------------
-            # Get Telegram chat
-            # ---------------------------------------------
+            # =============================================
+            # Get Channel Information
+            # =============================================
 
             chat = await event.get_chat()
 
@@ -444,15 +489,17 @@ async def new_message_handler(event):
                 ""
             )
 
-            # ---------------------------------------------
-            # Check Telegram file size BEFORE downloading
-            # ---------------------------------------------
+            # =============================================
+            # Check Telegram File Size
+            # =============================================
 
             telegram_size = None
 
             try:
 
-                telegram_size = message.file.size
+                telegram_size = (
+                    message.file.size
+                )
 
             except Exception:
 
@@ -475,9 +522,9 @@ async def new_message_handler(event):
 
                     return
 
-            # ---------------------------------------------
-            # Prepare filename
-            # ---------------------------------------------
+            # =============================================
+            # Create Safe Filename
+            # =============================================
 
             original_filename = safe_filename(
                 get_filename(
@@ -487,14 +534,17 @@ async def new_message_handler(event):
             )
 
             filename = (
-                f"{message_id}_{original_filename}"
+                f"{message_id}_"
+                f"{original_filename}"
             )
 
-            file_path = TEMP_DIR / filename
+            file_path = (
+                TEMP_DIR / filename
+            )
 
-            # ---------------------------------------------
-            # Download
-            # ---------------------------------------------
+            # =============================================
+            # Download Video From Telegram
+            # =============================================
 
             logger.info(
                 f"Downloading Telegram video | "
@@ -502,7 +552,9 @@ async def new_message_handler(event):
             )
 
             downloaded = await client.download_media(
+
                 message,
+
                 file=str(file_path)
             )
 
@@ -515,9 +567,9 @@ async def new_message_handler(event):
 
                 return
 
-            # ---------------------------------------------
-            # Verify downloaded file
-            # ---------------------------------------------
+            # =============================================
+            # Verify Download
+            # =============================================
 
             if not file_path.exists():
 
@@ -528,6 +580,10 @@ async def new_message_handler(event):
 
                 return
 
+            # =============================================
+            # Get Actual File Size
+            # =============================================
+
             actual_size = file_path.stat().st_size
 
             logger.info(
@@ -535,6 +591,10 @@ async def new_message_handler(event):
                 f"message={message_id} | "
                 f"size={actual_size / 1024 / 1024:.2f} MB"
             )
+
+            # =============================================
+            # Final Size Check
+            # =============================================
 
             if actual_size > MAX_VIDEO_BYTES:
 
@@ -545,20 +605,24 @@ async def new_message_handler(event):
 
                 return
 
-            # ---------------------------------------------
-            # Send to n8n
-            # ---------------------------------------------
+            # =============================================
+            # Send To n8n
+            # =============================================
 
             response = await send_to_n8n(
+
                 file_path,
+
                 message,
+
                 channel_username,
+
                 channel_title
             )
 
-            # ---------------------------------------------
-            # Success
-            # ---------------------------------------------
+            # =============================================
+            # Check n8n Response
+            # =============================================
 
             if 200 <= response.status_code < 300:
 
@@ -570,6 +634,7 @@ async def new_message_handler(event):
             else:
 
                 logger.error(
+
                     f"n8n rejected video | "
                     f"message={message_id} | "
                     f"status={response.status_code} | "
@@ -589,12 +654,15 @@ async def new_message_handler(event):
     finally:
 
         # =================================================
-        # ALWAYS DELETE LOCAL VIDEO
+        # Always Delete Temporary Video
         # =================================================
 
         try:
 
-            if file_path and file_path.exists():
+            if (
+                file_path
+                and file_path.exists()
+            ):
 
                 file_path.unlink()
 
@@ -611,6 +679,10 @@ async def new_message_handler(event):
                 f"error={e}"
             )
 
+        # =================================================
+        # Remove From Processing Set
+        # =================================================
+
         processing_messages.discard(
             message_id
         )
@@ -622,7 +694,7 @@ async def new_message_handler(event):
 
 
 # =========================================================
-# TELEGRAM WORKER
+# Telegram Worker
 # =========================================================
 
 async def telegram_worker():
@@ -643,6 +715,10 @@ async def telegram_worker():
         f"Account: "
         f"{getattr(me, 'username', None) or me.id}"
     )
+
+    # =====================================================
+    # Verify Channel Access
+    # =====================================================
 
     try:
 
@@ -673,7 +749,7 @@ async def telegram_worker():
 
 
 # =========================================================
-# API SERVER
+# FastAPI Server
 # =========================================================
 
 async def api_server():
@@ -689,13 +765,15 @@ async def api_server():
         log_level="info"
     )
 
-    server = uvicorn.Server(config)
+    server = uvicorn.Server(
+        config
+    )
 
     await server.serve()
 
 
 # =========================================================
-# MAIN
+# Main
 # =========================================================
 
 async def main():
@@ -712,9 +790,10 @@ async def main():
         "========================================"
     )
 
-    # Clean EVERYTHING left from previous runs.
+    # Clean old files when service starts
     cleanup_temp_directory()
 
+    # Run Telegram + API simultaneously
     await asyncio.gather(
 
         telegram_worker(),
@@ -722,6 +801,10 @@ async def main():
         api_server()
     )
 
+
+# =========================================================
+# Entry Point
+# =========================================================
 
 if __name__ == "__main__":
 
@@ -733,4 +816,4 @@ if __name__ == "__main__":
 
         logger.info(
             "Service stopped."
-                )
+        )
