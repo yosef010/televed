@@ -2,8 +2,9 @@ import os
 import asyncio
 import logging
 import mimetypes
+import shutil
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import httpx
 import uvicorn
@@ -13,9 +14,9 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 
-# ============================================================
+# =========================================================
 # CONFIG
-# ============================================================
+# =========================================================
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
@@ -34,19 +35,18 @@ TEMP_DIR = Path(
     )
 )
 
-FILE_TTL_HOURS = int(
-    os.environ.get("FILE_TTL_HOURS", "6")
+# Maximum allowed video size.
+# Default: 200 MB
+MAX_VIDEO_MB = int(
+    os.environ.get("MAX_VIDEO_MB", "200")
 )
 
-TEMP_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024
 
 
-# ============================================================
+# =========================================================
 # LOGGING
-# ============================================================
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,33 +56,18 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-monitor")
 
 
-# ============================================================
-# FASTAPI
-# ============================================================
+# =========================================================
+# APP
+# =========================================================
 
 app = FastAPI(
     title="Telegram Video Monitor"
 )
 
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "telegram-video-monitor"
-    }
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok"
-    }
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
+# =========================================================
+# TELEGRAM CLIENT
+# =========================================================
 
 client = TelegramClient(
     StringSession(TELEGRAM_SESSION),
@@ -91,35 +76,51 @@ client = TelegramClient(
 )
 
 
-# Prevent processing the same message twice
+# =========================================================
+# PROCESS CONTROL
+# =========================================================
+
+# IMPORTANT:
+# Only ONE video is processed at a time.
+#
+# This protects the Railway service from multiple
+# simultaneous large downloads/uploads.
+process_lock = asyncio.Lock()
+
+# Prevent duplicate processing while the service is alive.
 processing_messages = set()
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+# =========================================================
+# FILE HELPERS
+# =========================================================
 
-def is_video(message):
+def safe_filename(filename: str) -> str:
     """
-    Check whether Telegram message contains a video.
+    Make Telegram filename safe for Linux filesystem.
     """
 
-    if message.video:
-        return True
+    filename = os.path.basename(filename)
 
-    if message.document:
+    allowed = (
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
+        "._- "
+    )
 
-        mime_type = (
-            message.document.mime_type
-            or ""
-        )
+    filename = "".join(
+        char if char in allowed else "_"
+        for char in filename
+    )
 
-        return mime_type.startswith("video/")
-
-    return False
+    return filename[:150]
 
 
-def get_filename(message, message_id):
+def get_filename(message, message_id: int) -> str:
+    """
+    Get original filename if Telegram provides one.
+    """
 
     if message.document:
 
@@ -134,89 +135,92 @@ def get_filename(message, message_id):
     return f"telegram_video_{message_id}.mp4"
 
 
-def safe_filename(filename):
+def is_video(message) -> bool:
+    """
+    Detect Telegram videos.
+    """
 
-    filename = os.path.basename(
-        filename
+    if message.video:
+        return True
+
+    if message.document:
+
+        mime_type = message.document.mime_type or ""
+
+        if mime_type.startswith("video/"):
+            return True
+
+    return False
+
+
+def cleanup_temp_directory():
+    """
+    Delete ALL old temporary files when the service starts.
+    """
+
+    TEMP_DIR.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    allowed = (
-        "abcdefghijklmnopqrstuvwxyz"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "0123456789"
-        "._- "
-    )
+    deleted = 0
 
-    filename = "".join(
-        c if c in allowed else "_"
-        for c in filename
-    )
-
-    return filename[:150]
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-async def cleanup_old_files():
-
-    while True:
+    for item in TEMP_DIR.iterdir():
 
         try:
 
-            now = datetime.now(
-                timezone.utc
-            )
+            if item.is_file() or item.is_symlink():
 
-            max_age = timedelta(
-                hours=FILE_TTL_HOURS
-            )
+                item.unlink()
+                deleted += 1
 
-            for file in TEMP_DIR.iterdir():
+            elif item.is_dir():
 
-                if not file.is_file():
-                    continue
-
-                modified = datetime.fromtimestamp(
-                    file.stat().st_mtime,
-                    timezone.utc
-                )
-
-                if now - modified > max_age:
-
-                    logger.info(
-                        f"Deleting expired file: {file.name}"
-                    )
-
-                    try:
-                        file.unlink()
-
-                    except Exception as e:
-
-                        logger.error(
-                            f"Delete error: {e}"
-                        )
+                shutil.rmtree(item)
+                deleted += 1
 
         except Exception as e:
 
             logger.error(
-                f"Cleanup error: {e}"
+                f"Startup cleanup failed for {item}: {e}"
             )
 
-        await asyncio.sleep(1800)
+    logger.info(
+        f"Startup cleanup complete. Deleted {deleted} old items."
+    )
 
 
-# ============================================================
-# DELETE FILE AFTER N8N FINISHES
-# ============================================================
+# =========================================================
+# HEALTH ENDPOINTS
+# =========================================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "status": "online",
+        "service": "telegram-video-monitor"
+    }
+
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "ok",
+        "processing": len(processing_messages),
+        "temp_dir": str(TEMP_DIR)
+    }
+
+
+# =========================================================
+# OPTIONAL MANUAL DELETE ENDPOINT
+# =========================================================
 
 @app.post("/complete/{filename}")
 async def complete_video(
     filename: str,
-    x_webhook_secret: str | None = Header(
-        default=None
-    )
+    x_webhook_secret: str | None = Header(default=None)
 ):
 
     if x_webhook_secret != WEBHOOK_SECRET:
@@ -226,9 +230,7 @@ async def complete_video(
             detail="Unauthorized"
         )
 
-    filename = safe_filename(
-        filename
-    )
+    filename = safe_filename(filename)
 
     file_path = TEMP_DIR / filename
 
@@ -243,7 +245,7 @@ async def complete_video(
         file_path.unlink()
 
         logger.info(
-            f"Deleted completed video: {filename}"
+            f"Deleted file through API: {filename}"
         )
 
         return {
@@ -263,12 +265,12 @@ async def complete_video(
         )
 
 
-# ============================================================
+# =========================================================
 # SEND VIDEO TO N8N
-# ============================================================
+# =========================================================
 
 async def send_to_n8n(
-    file_path,
+    file_path: Path,
     message,
     channel_username,
     channel_title
@@ -277,46 +279,46 @@ async def send_to_n8n(
     filename = file_path.name
 
     mime_type = (
-        mimetypes.guess_type(
-            str(file_path)
-        )[0]
+        mimetypes.guess_type(str(file_path))[0]
         or "video/mp4"
+    )
+
+    file_size = file_path.stat().st_size
+
+    logger.info(
+        f"Preparing upload | "
+        f"message={message.id} | "
+        f"file={filename} | "
+        f"size={file_size / 1024 / 1024:.2f} MB"
     )
 
     data = {
 
-        "message_id": str(
-            message.id
-        ),
+        "message_id": str(message.id),
 
         "filename": filename,
 
-        "caption": (
-            message.message
-            or ""
-        ),
+        "caption": message.message or "",
 
-        "channel_username": (
-            channel_username
-            or ""
-        ),
+        "channel_username":
+            channel_username or "",
 
-        "channel_title": (
-            channel_title
-            or ""
-        )
+        "channel_title":
+            channel_title or ""
     }
 
     headers = {
-
-        "X-Webhook-Secret":
-            WEBHOOK_SECRET
+        "X-Webhook-Secret": WEBHOOK_SECRET
     }
 
     timeout = httpx.Timeout(
+
         connect=30,
+
         read=900,
+
         write=900,
+
         pool=30
     )
 
@@ -338,23 +340,39 @@ async def send_to_n8n(
                 )
             }
 
+            logger.info(
+                f"Sending video to n8n | "
+                f"message={message.id}"
+            )
+
             response = await http.post(
+
                 N8N_WEBHOOK_URL,
+
                 data=data,
+
                 files=files,
+
                 headers=headers
             )
+
+    logger.info(
+        f"n8n response | "
+        f"message={message.id} | "
+        f"status={response.status_code}"
+    )
 
     return response
 
 
-# ============================================================
-# TELEGRAM NEW MESSAGE
-# ============================================================
+# =========================================================
+# TELEGRAM EVENT
+# =========================================================
 
 @client.on(
     events.NewMessage(
-        chats=TELEGRAM_CHANNEL
+        chats=TELEGRAM_CHANNEL,
+        incoming=True
     )
 )
 async def new_message_handler(event):
@@ -364,161 +382,248 @@ async def new_message_handler(event):
     message_id = message.id
 
     logger.info(
-        f"New Telegram message: {message_id}"
+        f"Telegram message received | "
+        f"id={message_id}"
     )
 
-    # ----------------------------------------
-    # Prevent duplicates
-    # ----------------------------------------
-
-    if message_id in processing_messages:
-
-        logger.info(
-            f"Already processing {message_id}"
-        )
-
-        return
-
-    # ----------------------------------------
-    # Ignore non-video posts
-    # ----------------------------------------
+    # -----------------------------------------------------
+    # Check video
+    # -----------------------------------------------------
 
     if not is_video(message):
 
         logger.info(
-            f"Message {message_id} is not a video"
+            f"Message {message_id} ignored: not a video."
         )
 
         return
 
-    processing_messages.add(
-        message_id
-    )
+    # -----------------------------------------------------
+    # Prevent duplicate processing
+    # -----------------------------------------------------
 
-    file_path = None
+    if message_id in processing_messages:
+
+        logger.warning(
+            f"Message {message_id} already processing. "
+            f"Ignoring duplicate event."
+        )
+
+        return
+
+    processing_messages.add(message_id)
 
     try:
 
-        # ------------------------------------
-        # Telegram info
-        # ------------------------------------
+        # -------------------------------------------------
+        # ONLY ONE VIDEO AT A TIME
+        # -------------------------------------------------
 
-        chat = await event.get_chat()
+        async with process_lock:
 
-        channel_username = getattr(
-            chat,
-            "username",
-            None
-        )
+            logger.info(
+                f"Processing started | "
+                f"message={message_id}"
+            )
 
-        channel_title = getattr(
-            chat,
-            "title",
-            ""
-        )
+            # ---------------------------------------------
+            # Get Telegram chat
+            # ---------------------------------------------
 
-        # ------------------------------------
-        # Filename
-        # ------------------------------------
+            chat = await event.get_chat()
 
-        filename = safe_filename(
-            get_filename(
+            channel_username = getattr(
+                chat,
+                "username",
+                None
+            )
+
+            channel_title = getattr(
+                chat,
+                "title",
+                ""
+            )
+
+            # ---------------------------------------------
+            # Check Telegram file size BEFORE downloading
+            # ---------------------------------------------
+
+            telegram_size = None
+
+            try:
+
+                telegram_size = message.file.size
+
+            except Exception:
+
+                telegram_size = None
+
+            if telegram_size:
+
+                logger.info(
+                    f"Telegram file size | "
+                    f"{telegram_size / 1024 / 1024:.2f} MB"
+                )
+
+                if telegram_size > MAX_VIDEO_BYTES:
+
+                    logger.error(
+                        f"Video rejected: "
+                        f"file is larger than "
+                        f"{MAX_VIDEO_MB} MB"
+                    )
+
+                    return
+
+            # ---------------------------------------------
+            # Prepare filename
+            # ---------------------------------------------
+
+            original_filename = safe_filename(
+                get_filename(
+                    message,
+                    message_id
+                )
+            )
+
+            filename = (
+                f"{message_id}_{original_filename}"
+            )
+
+            file_path = TEMP_DIR / filename
+
+            # ---------------------------------------------
+            # Download
+            # ---------------------------------------------
+
+            logger.info(
+                f"Downloading Telegram video | "
+                f"message={message_id}"
+            )
+
+            downloaded = await client.download_media(
                 message,
-                message_id
-            )
-        )
-
-        filename = (
-            f"{message_id}_{filename}"
-        )
-
-        file_path = TEMP_DIR / filename
-
-        # ------------------------------------
-        # Download
-        # ------------------------------------
-
-        logger.info(
-            f"Downloading video {message_id}..."
-        )
-
-        downloaded = await client.download_media(
-            message,
-            file=str(file_path)
-        )
-
-        if not downloaded:
-
-            logger.error(
-                f"Download failed: {message_id}"
+                file=str(file_path)
             )
 
-            return
+            if not downloaded:
 
-        logger.info(
-            f"Downloaded: {file_path}"
-        )
+                logger.error(
+                    f"Download failed | "
+                    f"message={message_id}"
+                )
 
-        # ------------------------------------
-        # Send to n8n
-        # ------------------------------------
+                return
 
-        logger.info(
-            f"Sending {filename} to n8n..."
-        )
+            # ---------------------------------------------
+            # Verify downloaded file
+            # ---------------------------------------------
 
-        response = await send_to_n8n(
-            file_path,
-            message,
-            channel_username,
-            channel_title
-        )
+            if not file_path.exists():
 
-        logger.info(
-            f"n8n HTTP status: {response.status_code}"
-        )
+                logger.error(
+                    f"Downloaded file does not exist | "
+                    f"{file_path}"
+                )
 
-        if response.status_code >= 400:
+                return
 
-            logger.error(
-                f"n8n rejected video: "
-                f"{response.text[:1000]}"
+            actual_size = file_path.stat().st_size
+
+            logger.info(
+                f"Download complete | "
+                f"message={message_id} | "
+                f"size={actual_size / 1024 / 1024:.2f} MB"
             )
 
-            # Keep file.
-            # Cleanup will remove it later.
+            if actual_size > MAX_VIDEO_BYTES:
 
-            return
+                logger.error(
+                    f"Downloaded file exceeds "
+                    f"MAX_VIDEO_MB={MAX_VIDEO_MB}"
+                )
 
-        logger.info(
-            f"Video accepted by n8n: {filename}"
-        )
+                return
 
-        # IMPORTANT:
-        # DO NOT DELETE HERE.
-        #
-        # n8n will call:
-        #
-        # POST /complete/{filename}
-        #
-        # after publishing finishes.
+            # ---------------------------------------------
+            # Send to n8n
+            # ---------------------------------------------
+
+            response = await send_to_n8n(
+                file_path,
+                message,
+                channel_username,
+                channel_title
+            )
+
+            # ---------------------------------------------
+            # Success
+            # ---------------------------------------------
+
+            if 200 <= response.status_code < 300:
+
+                logger.info(
+                    f"n8n accepted video | "
+                    f"message={message_id}"
+                )
+
+            else:
+
+                logger.error(
+                    f"n8n rejected video | "
+                    f"message={message_id} | "
+                    f"status={response.status_code} | "
+                    f"response={response.text[:1000]}"
+                )
+
+                return
 
     except Exception as e:
 
         logger.exception(
-            f"Processing error for {message_id}: {e}"
+            f"Processing failed | "
+            f"message={message_id} | "
+            f"error={e}"
         )
 
     finally:
+
+        # =================================================
+        # ALWAYS DELETE LOCAL VIDEO
+        # =================================================
+
+        try:
+
+            if file_path and file_path.exists():
+
+                file_path.unlink()
+
+                logger.info(
+                    f"Temporary video deleted | "
+                    f"message={message_id}"
+                )
+
+        except Exception as e:
+
+            logger.error(
+                f"Could not delete temporary file | "
+                f"message={message_id} | "
+                f"error={e}"
+            )
 
         processing_messages.discard(
             message_id
         )
 
+        logger.info(
+            f"Processing finished | "
+            f"message={message_id}"
+        )
 
-# ============================================================
+
+# =========================================================
 # TELEGRAM WORKER
-# ============================================================
+# =========================================================
 
 async def telegram_worker():
 
@@ -539,7 +644,6 @@ async def telegram_worker():
         f"{getattr(me, 'username', None) or me.id}"
     )
 
-    # Check channel access
     try:
 
         entity = await client.get_entity(
@@ -553,57 +657,69 @@ async def telegram_worker():
 
     except Exception as e:
 
-        logger.error(
-            f"Cannot access channel "
-            f"{TELEGRAM_CHANNEL}: {e}"
+        logger.exception(
+            f"Cannot access channel: "
+            f"{TELEGRAM_CHANNEL}"
         )
 
         raise
 
     logger.info(
-        f"Monitoring: {TELEGRAM_CHANNEL}"
+        f"Monitoring channel: "
+        f"{TELEGRAM_CHANNEL}"
     )
 
     await client.run_until_disconnected()
 
 
-# ============================================================
-# FASTAPI SERVER
-# ============================================================
+# =========================================================
+# API SERVER
+# =========================================================
 
 async def api_server():
 
     config = uvicorn.Config(
+
         app,
+
         host="0.0.0.0",
+
         port=PORT,
+
         log_level="info"
     )
 
-    server = uvicorn.Server(
-        config
-    )
+    server = uvicorn.Server(config)
 
     await server.serve()
 
 
-# ============================================================
+# =========================================================
 # MAIN
-# ============================================================
+# =========================================================
 
 async def main():
 
     logger.info(
-        "Starting Telegram Video Monitor..."
+        "========================================"
     )
+
+    logger.info(
+        "Telegram Video Monitor starting..."
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    # Clean EVERYTHING left from previous runs.
+    cleanup_temp_directory()
 
     await asyncio.gather(
 
         telegram_worker(),
 
-        api_server(),
-
-        cleanup_old_files()
+        api_server()
     )
 
 
@@ -611,12 +727,10 @@ if __name__ == "__main__":
 
     try:
 
-        asyncio.run(
-            main()
-        )
+        asyncio.run(main())
 
     except KeyboardInterrupt:
 
         logger.info(
-            "Service stopped"
-        )
+            "Service stopped."
+                )
